@@ -10,7 +10,8 @@ from flask import Flask, flash, g, redirect, render_template, request, session, 
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATABASE = os.path.join(BASE_DIR, "database.db")
+# Vercel's deployed filesystem is read-only; /tmp is the writable runtime location.
+DATABASE = "/tmp/database.db" if os.getenv("VERCEL") else os.path.join(BASE_DIR, "database.db")
 VIT_EMAIL_SUFFIX = os.getenv("VIT_EMAIL_SUFFIX", "@vitstudent.ac.in").lower()
 
 app = Flask(__name__)
@@ -355,3 +356,6 @@ def breakdown(match_id):
 if __name__ == "__main__":
     init_db()
     app.run(debug=True)
+else:
+    # Production imports `app` directly, so apply/create the schema before requests.
+    init_db()
