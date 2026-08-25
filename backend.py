@@ -201,7 +201,11 @@ def generate_breakdown(match, me, won):
 
 @app.route("/")
 def index():
-    return redirect(url_for("profile") if "user_id" in session else url_for("practice") if session.get("guest") else url_for("login"))
+    if "user_id" in session:
+        return redirect(url_for("profile"))
+    if session.get("guest"):
+        return redirect(url_for("practice"))
+    return render_template("landing.html")
 
 
 @app.route("/guest")
