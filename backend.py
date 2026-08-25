@@ -10,8 +10,7 @@ from flask import Flask, flash, g, redirect, render_template, request, session, 
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-# Vercel's filesystem is read-only except /tmp; local development retains database.db.
-DATABASE = "/tmp/database.db" if os.getenv("VERCEL") else os.path.join(BASE_DIR, "database.db")
+DATABASE = os.path.join(BASE_DIR, "database.db")
 VIT_EMAIL_SUFFIX = os.getenv("VIT_EMAIL_SUFFIX", "@vitstudent.ac.in").lower()
 
 app = Flask(__name__)
@@ -42,6 +41,15 @@ def init_db():
             password_hash TEXT NOT NULL,
             github_username TEXT,
             leetcode_username TEXT,
+            linkedin_url TEXT,
+            instagram_handle TEXT,
+            hackerrank_username TEXT,
+            neetcode_username TEXT,
+            coding_preferences TEXT DEFAULT '',
+            interests TEXT DEFAULT '',
+            consented_data INTEGER NOT NULL DEFAULT 0,
+            xp INTEGER NOT NULL DEFAULT 0,
+            frame TEXT DEFAULT 'Starter',
             elo INTEGER NOT NULL DEFAULT 1000,
             matches_played INTEGER NOT NULL DEFAULT 0,
             wins INTEGER NOT NULL DEFAULT 0,
@@ -60,7 +68,39 @@ def init_db():
             FOREIGN KEY(player_two_id) REFERENCES users(id),
             FOREIGN KEY(winner_id) REFERENCES users(id)
         );
+        CREATE TABLE IF NOT EXISTS club_enrollments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            club_name TEXT NOT NULL,
+            desired_role TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, club_name)
+        );
+        CREATE TABLE IF NOT EXISTS study_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT NOT NULL,
+            exam_label TEXT NOT NULL,
+            meeting_link TEXT,
+            members INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
     """)
+    # Existing demo databases are upgraded without losing players.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
+    upgrades = {
+        "linkedin_url": "TEXT", "instagram_handle": "TEXT", "hackerrank_username": "TEXT",
+        "neetcode_username": "TEXT", "coding_preferences": "TEXT DEFAULT ''", "interests": "TEXT DEFAULT ''",
+        "consented_data": "INTEGER NOT NULL DEFAULT 0", "xp": "INTEGER NOT NULL DEFAULT 0", "frame": "TEXT DEFAULT 'Starter'",
+    }
+    for column, definition in upgrades.items():
+        if column not in columns:
+            connection.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+    if not connection.execute("SELECT 1 FROM study_groups LIMIT 1").fetchone():
+        connection.executemany("INSERT INTO study_groups (topic, exam_label, meeting_link, members) VALUES (?, ?, ?, ?)", [
+            ("Data Structures", "CAT-1 preparation", "https://meet.google.com", 18),
+            ("Dynamic Programming", "Interview sprint", "https://meet.google.com", 12),
+            ("Python fundamentals", "Lab assessment", "https://meet.google.com", 9),
+        ])
     connection.commit()
     connection.close()
 
@@ -77,6 +117,16 @@ def login_required(view):
 
 def current_user():
     return db().execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+
+
+def guest_or_login(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session and not session.get("guest"):
+            flash("Log in or use guest practice to continue.", "error")
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+    return wrapped
 
 
 def fetch_github(username):
@@ -115,8 +165,8 @@ def update_elo(winner, loser):
     winner_elo = round(winner["elo"] + k * (1 - expected_score(winner["elo"], loser["elo"])))
     loser_elo = round(loser["elo"] + k * (0 - expected_score(loser["elo"], winner["elo"])))
     connection = db()
-    connection.execute("UPDATE users SET elo = ?, wins = wins + 1, matches_played = matches_played + 1 WHERE id = ?", (winner_elo, winner["id"]))
-    connection.execute("UPDATE users SET elo = ?, matches_played = matches_played + 1 WHERE id = ?", (loser_elo, loser["id"]))
+    connection.execute("UPDATE users SET elo = ?, wins = wins + 1, matches_played = matches_played + 1, xp = xp + 50 WHERE id = ?", (winner_elo, winner["id"]))
+    connection.execute("UPDATE users SET elo = ?, matches_played = matches_played + 1, xp = xp + 25 WHERE id = ?", (loser_elo, loser["id"]))
     connection.commit()
     return winner_elo, loser_elo
 
@@ -150,7 +200,15 @@ def generate_breakdown(match, me, won):
 
 @app.route("/")
 def index():
-    return redirect(url_for("profile") if "user_id" in session else url_for("login"))
+    return redirect(url_for("profile") if "user_id" in session else url_for("practice") if session.get("guest") else url_for("login"))
+
+
+@app.route("/guest")
+def guest():
+    session.clear()
+    session["guest"] = True
+    flash("Guest mode is active: solo practice only; no profile, club enrollment, or ranking data is saved.", "success")
+    return redirect(url_for("practice"))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -163,6 +221,7 @@ def login():
             flash("Invalid email or password.", "error")
         else:
             session["user_id"] = user["id"]
+            session.pop("guest", None)
             return redirect(url_for("profile"))
     return render_template("login.html", mode="login", vit_suffix=VIT_EMAIL_SUFFIX)
 
@@ -182,6 +241,7 @@ def signup():
                 cursor = db().execute("INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)", (name, email, generate_password_hash(password)))
                 db().commit()
                 session["user_id"] = cursor.lastrowid
+                session.pop("guest", None)
                 return redirect(url_for("profile"))
             except sqlite3.IntegrityError:
                 flash("An account with that email already exists.", "error")
@@ -199,11 +259,45 @@ def logout():
 def profile():
     user = current_user()
     if request.method == "POST":
-        db().execute("UPDATE users SET github_username = ?, leetcode_username = ? WHERE id = ?", (request.form.get("github_username", "").strip(), request.form.get("leetcode_username", "").strip(), user["id"]))
+        fields = ("github_username", "leetcode_username", "linkedin_url", "instagram_handle", "hackerrank_username", "neetcode_username", "coding_preferences", "interests")
+        values = [request.form.get(field, "").strip() for field in fields]
+        values.extend([1 if request.form.get("consented_data") else 0, request.form.get("frame", "Starter"), user["id"]])
+        db().execute(f"UPDATE users SET {', '.join(f'{field} = ?' for field in fields)}, consented_data = ?, frame = ? WHERE id = ?", values)
         db().commit()
         flash("Profile connections saved.", "success")
         return redirect(url_for("profile"))
-    return render_template("profile.html", user=user, github=fetch_github(user["github_username"]), leetcode=fetch_leetcode(user["leetcode_username"]))
+    groups = db().execute("SELECT * FROM study_groups ORDER BY members DESC, created_at DESC LIMIT 4").fetchall()
+    clubs = db().execute("SELECT * FROM club_enrollments WHERE user_id = ? ORDER BY created_at DESC", (user["id"],)).fetchall()
+    leaderboard = db().execute("SELECT name, elo, xp, frame FROM users ORDER BY elo DESC LIMIT 5").fetchall()
+    return render_template("profile.html", user=user, github=fetch_github(user["github_username"]), leetcode=fetch_leetcode(user["leetcode_username"]), groups=groups, clubs=clubs, leaderboard=leaderboard)
+
+
+@app.route("/practice", methods=["GET", "POST"])
+@guest_or_login
+def practice():
+    if request.method == "POST":
+        topic = request.form.get("topic", "Arrays & Hashing")
+        minutes = request.form.get("minutes", type=int) or 25
+        if "user_id" in session:
+            db().execute("UPDATE users SET xp = xp + ? WHERE id = ?", (max(10, minutes), session["user_id"]))
+            db().commit()
+            flash(f"Practice logged: +{max(10, minutes)} XP. Your rank stays untouched in solo practice.", "success")
+        else:
+            flash("Nice session. Create a VIT account whenever you want to save XP and join groups.", "success")
+        return redirect(url_for("practice"))
+    return render_template("practice.html", guest=session.get("guest", False), user=current_user() if "user_id" in session else None)
+
+
+@app.route("/clubs", methods=["POST"])
+@login_required
+def clubs():
+    club = request.form.get("club_name", "").strip()
+    role = request.form.get("desired_role", "Member").strip()
+    if club:
+        db().execute("INSERT INTO club_enrollments (user_id, club_name, desired_role) VALUES (?, ?, ?) ON CONFLICT(user_id, club_name) DO UPDATE SET desired_role=excluded.desired_role", (session["user_id"], club, role))
+        db().commit()
+        flash(f"Interest saved for {club} — {role} track.", "success")
+    return redirect(url_for("profile"))
 
 
 @app.route("/match", methods=["GET", "POST"])
@@ -261,6 +355,3 @@ def breakdown(match_id):
 if __name__ == "__main__":
     init_db()
     app.run(debug=True)
-else:
-    # Vercel imports the module instead of executing __main__.
-    init_db()
